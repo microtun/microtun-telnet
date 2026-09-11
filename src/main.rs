@@ -8,7 +8,7 @@ use clap::Parser;
 mod keymap;
 mod telnet;
 mod tui;
-mod upload;
+mod ymodem;
 
 use telnet::TelnetClient;
 

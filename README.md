@@ -53,7 +53,6 @@ Ctrl-A Z   Command Summary / help
 Ctrl-A S   Send file (YMODEM)
 Ctrl-A C   Clear screen
 Ctrl-A Q   Quit
-Ctrl-A X   Exit
 Ctrl-A Ctrl-A   Send a literal Ctrl-A to the remote peer
 ```
 

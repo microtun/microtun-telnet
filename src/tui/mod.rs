@@ -19,7 +19,7 @@ use tui_term::{vt100, widget::PseudoTerminal};
 use crate::{
     keymap::{COMMAND_KEY, is_command_key, key_to_telnet_bytes},
     telnet::{NetworkRead, TelnetClient},
-    upload::{self, UploadEvent},
+    ymodem::{self, UploadEvent},
 };
 
 mod file_picker;
@@ -162,10 +162,7 @@ fn run_loop(
                                 state.status = "Screen cleared".to_owned();
                                 state.mode = TuiMode::Session;
                             }
-                            KeyCode::Char('q')
-                            | KeyCode::Char('Q')
-                            | KeyCode::Char('x')
-                            | KeyCode::Char('X') => {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 return Ok(TuiEnd::Quit);
                             }
                             KeyCode::Esc | KeyCode::Enter => {
@@ -188,10 +185,7 @@ fn run_loop(
                                 state.status = "Screen cleared".to_owned();
                                 state.mode = TuiMode::Session;
                             }
-                            KeyCode::Char('q')
-                            | KeyCode::Char('Q')
-                            | KeyCode::Char('x')
-                            | KeyCode::Char('X') => {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
                                 return Ok(TuiEnd::Quit);
                             }
                             _ => {}
@@ -279,7 +273,7 @@ fn execute_upload(
     draw_terminal_ui(terminal, parser, state)?;
 
     client.set_read_timeout(transfer_timeout)?;
-    let result = upload::send_file_with(client, path, |event| {
+    let result = ymodem::send_file_with(client, path, |event| {
         match event {
             UploadEvent::Output(byte) => parser.process(&[byte]),
             UploadEvent::Progress { sent, total } => {
@@ -368,7 +362,6 @@ fn draw_terminal_ui(
                             Line::from(""),
                             Line::from("  Send files................S"),
                             Line::from("  Clear Screen..............C"),
-                            Line::from("  eXit......................X"),
                             Line::from("  Quit......................Q"),
                             Line::from("  Help screen...............Z"),
                             Line::from(""),
