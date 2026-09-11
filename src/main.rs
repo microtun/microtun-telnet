@@ -18,7 +18,7 @@ const DEFAULT_TELNET_PORT: u16 = 23;
 #[command(
     name = "microtun-telnet",
     version,
-    about = "Interactive microtun Telnet client with built-in YMODEM uploads",
+    about = "Interactive Telnet client with YMODEM file upload capabilities",
     arg_required_else_help = true
 )]
 struct Cli {
