@@ -1,0 +1,19 @@
+[package]
+name = "microtun-telnet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Damian Peckett <damian@pecke.tt>"]
+description = "Interactive Telnet client for microtun devices with built-in YMODEM uploads"
+readme = "README.md"
+keywords = ["telnet", "ymodem", "terminal", "microtun"]
+categories = ["command-line-utilities", "network-programming"]
+repository = "https://github.com/microtun/microtun-telnet"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+crc = "3.4"
+crossterm = "0.28.1"
+ratatui = "0.29.0"
+tui-term = "0.2.0"
