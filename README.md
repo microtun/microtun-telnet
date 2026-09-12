@@ -2,6 +2,11 @@
 
 `microtun-telnet` is an interactive Telnet client with YMODEM file upload capabilities.
 
+The client is asynchronous end-to-end around Tokio. TCP I/O uses `tokio::net`, upload files use
+`tokio::fs`, terminal events are consumed through Crossterm's async `EventStream`, and YMODEM is
+provided by [`microtun-ymodem`](https://github.com/microtun/microtun-ymodem) `v0.1.0` rather than a
+client-local protocol implementation.
+
 ## Build
 
 A Rust 1.85 or newer toolchain is required.
@@ -34,9 +39,22 @@ The TCP port defaults to Telnet port `23`. Override it with `--port`:
 microtun-telnet 100.64.0.3 --port 2323
 ```
 
-Use `--timeout <SECONDS>` to change the connection and YMODEM transfer timeout. The
-client requires an interactive terminal; redirected stdin/stdout and a separate plain
+Use `--timeout <SECONDS>` to change the TCP connect timeout and the per-wait YMODEM transfer
+timeout. The client requires an interactive terminal; redirected stdin/stdout and a separate plain
 text mode are intentionally not supported.
+
+## Async architecture
+
+The Telnet client owns the Tokio `TcpStream` and implements `microtun_ymodem::Transport` directly.
+Incoming Telnet negotiation and subnegotiation bytes are removed before YMODEM sees the stream,
+and outgoing YMODEM data is Telnet-escaped so protocol bytes containing `0xff` remain binary-safe.
+
+`src/upload.rs` is intentionally thin: it adapts `tokio::fs::File` to
+`microtun_ymodem::Source`, builds the YMODEM metadata/configuration, and maps library events and
+errors into the CLI. The YMODEM state machine itself lives only in `microtun-ymodem`.
+
+The interactive session uses `tokio::select!` to wait on terminal events and socket readability
+without periodic blocking read timeouts.
 
 ## Terminal UI
 
@@ -59,8 +77,9 @@ Ctrl-A Ctrl-A   Send a literal Ctrl-A to the remote peer
 Choosing `S` opens an in-terminal file picker rooted at the current working directory.
 Use the arrow keys to select an entry, `Enter`/Right to enter a directory or send the
 selected file, Backspace/Left to move to the parent directory, Home/End and Page
-Up/Down for faster navigation, `Ctrl-R` to refresh, and `Esc` to cancel. YMODEM progress
-is shown in a temporary popup while the transfer runs.
+Up/Down for faster navigation, `Ctrl-R` to refresh, and `Esc` to cancel. Directory reads
+and file uploads use Tokio filesystem I/O. YMODEM progress is shown in a temporary popup while the
+transfer runs.
 
 ## Binary releases
 

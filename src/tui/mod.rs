@@ -2,10 +2,11 @@ use std::{io, path::Path, time::Duration};
 
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{Event, EventStream, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures_util::StreamExt;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -19,7 +20,7 @@ use tui_term::{vt100, widget::PseudoTerminal};
 use crate::{
     keymap::{COMMAND_KEY, is_command_key, key_to_telnet_bytes},
     telnet::{NetworkRead, TelnetClient},
-    ymodem::{self, UploadEvent},
+    upload::{self, UploadEvent},
 };
 
 mod file_picker;
@@ -67,7 +68,7 @@ struct TuiState {
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-pub(crate) fn run_session(
+pub(crate) async fn run_session(
     mut client: TelnetClient,
     target: &str,
     port: u16,
@@ -105,140 +106,150 @@ pub(crate) fn run_session(
             &mut parser,
             &mut state,
             transfer_timeout,
-        )?
+        )
+        .await?
     };
 
-    client.shutdown();
+    client.shutdown().await;
     if end == TuiEnd::RemoteClosed {
         eprintln!("connection closed by remote host");
     }
     Ok(())
 }
 
-fn run_loop(
+async fn run_loop(
     terminal: &mut TuiTerminal,
     client: &mut TelnetClient,
     parser: &mut vt100::Parser,
     state: &mut TuiState,
     transfer_timeout: Duration,
 ) -> Result<TuiEnd, String> {
+    let mut events = EventStream::new();
+
     loop {
         resize_remote_parser(terminal, parser)?;
         draw_terminal_ui(terminal, parser, state)?;
 
-        while event::poll(Duration::ZERO)
-            .map_err(|error| format!("poll terminal input: {error}"))?
-        {
-            let event = event::read().map_err(|error| format!("read terminal input: {error}"))?;
-            match event {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    match state.mode {
-                        TuiMode::Session => {
-                            if is_command_key(key) {
-                                state.mode = TuiMode::CommandPrefix;
-                                continue;
-                            }
+        tokio::select! {
+            event = events.next() => {
+                let event = event
+                    .ok_or_else(|| "terminal event stream closed".to_owned())?
+                    .map_err(|error| format!("read terminal input: {error}"))?;
 
-                            if let Some(bytes) = key_to_telnet_bytes(key) {
-                                client.write_data(&bytes)?;
+                match event {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match state.mode {
+                            TuiMode::Session => {
+                                if is_command_key(key) {
+                                    state.mode = TuiMode::CommandPrefix;
+                                    continue;
+                                }
+
+                                if let Some(bytes) = key_to_telnet_bytes(key) {
+                                    client.write_data(&bytes).await?;
+                                }
                             }
-                        }
-                        TuiMode::CommandPrefix => match key.code {
-                            _ if is_command_key(key) => {
-                                client.write_data(&[COMMAND_KEY])?;
-                                state.status = "Sent Ctrl-A to remote".to_owned();
-                                state.mode = TuiMode::Session;
-                            }
-                            KeyCode::Char('z') | KeyCode::Char('Z') => {
-                                state.mode = TuiMode::CommandSummary;
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                open_file_picker(state);
-                            }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                parser.process(b"\x1b[2J\x1b[H");
-                                state.status = "Screen cleared".to_owned();
-                                state.mode = TuiMode::Session;
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                return Ok(TuiEnd::Quit);
-                            }
-                            KeyCode::Esc | KeyCode::Enter => {
-                                state.mode = TuiMode::Session;
-                            }
-                            _ => {
-                                state.status = "Unknown command; Ctrl-A Z for help".to_owned();
-                                state.mode = TuiMode::Session;
-                            }
-                        },
-                        TuiMode::CommandSummary => match key.code {
-                            KeyCode::Esc | KeyCode::Enter => {
-                                state.mode = TuiMode::Session;
-                            }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                open_file_picker(state);
-                            }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                parser.process(b"\x1b[2J\x1b[H");
-                                state.status = "Screen cleared".to_owned();
-                                state.mode = TuiMode::Session;
-                            }
-                            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                                return Ok(TuiEnd::Quit);
-                            }
-                            _ => {}
-                        },
-                        TuiMode::FilePicker => {
-                            let action = match state.file_picker.as_mut() {
-                                Some(picker) => picker.handle_key(key),
-                                None => Ok(PickerAction::Cancel),
-                            };
-                            match action {
-                                Ok(PickerAction::None) => {}
-                                Ok(PickerAction::Cancel) => {
-                                    state.file_picker = None;
+                            TuiMode::CommandPrefix => match key.code {
+                                _ if is_command_key(key) => {
+                                    client.write_data(&[COMMAND_KEY]).await?;
+                                    state.status = "Sent Ctrl-A to remote".to_owned();
                                     state.mode = TuiMode::Session;
                                 }
-                                Ok(PickerAction::Upload(path)) => {
-                                    state.file_picker = None;
+                                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                                    state.mode = TuiMode::CommandSummary;
+                                }
+                                KeyCode::Char('s') | KeyCode::Char('S') => {
+                                    open_file_picker(state).await;
+                                }
+                                KeyCode::Char('c') | KeyCode::Char('C') => {
+                                    parser.process(b"\x1b[2J\x1b[H");
+                                    state.status = "Screen cleared".to_owned();
                                     state.mode = TuiMode::Session;
-                                    if let Err(error) = execute_upload(
-                                        terminal,
-                                        client,
-                                        parser,
-                                        state,
-                                        &path,
-                                        transfer_timeout,
-                                    ) {
-                                        state.status = format!("YMODEM failed: {error}");
+                                }
+                                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    return Ok(TuiEnd::Quit);
+                                }
+                                KeyCode::Esc | KeyCode::Enter => {
+                                    state.mode = TuiMode::Session;
+                                }
+                                _ => {
+                                    state.status = "Unknown command; Ctrl-A Z for help".to_owned();
+                                    state.mode = TuiMode::Session;
+                                }
+                            },
+                            TuiMode::CommandSummary => match key.code {
+                                KeyCode::Esc | KeyCode::Enter => {
+                                    state.mode = TuiMode::Session;
+                                }
+                                KeyCode::Char('s') | KeyCode::Char('S') => {
+                                    open_file_picker(state).await;
+                                }
+                                KeyCode::Char('c') | KeyCode::Char('C') => {
+                                    parser.process(b"\x1b[2J\x1b[H");
+                                    state.status = "Screen cleared".to_owned();
+                                    state.mode = TuiMode::Session;
+                                }
+                                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    return Ok(TuiEnd::Quit);
+                                }
+                                _ => {}
+                            },
+                            TuiMode::FilePicker => {
+                                let action = match state.file_picker.as_mut() {
+                                    Some(picker) => picker.handle_key(key).await,
+                                    None => Ok(PickerAction::Cancel),
+                                };
+                                match action {
+                                    Ok(PickerAction::None) => {}
+                                    Ok(PickerAction::Cancel) => {
+                                        state.file_picker = None;
+                                        state.mode = TuiMode::Session;
                                     }
-                                }
-                                Err(error) => {
-                                    state.status = format!("File picker: {error}");
+                                    Ok(PickerAction::Upload(path)) => {
+                                        state.file_picker = None;
+                                        state.mode = TuiMode::Session;
+                                        if let Err(error) = execute_upload(
+                                            terminal,
+                                            client,
+                                            parser,
+                                            state,
+                                            &path,
+                                            transfer_timeout,
+                                        )
+                                        .await
+                                        {
+                                            state.status = format!("YMODEM failed: {error}");
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.status = format!("File picker: {error}");
+                                    }
                                 }
                             }
                         }
                     }
+                    Event::Resize(_, _) => {
+                        resize_remote_parser(terminal, parser)?;
+                    }
+                    _ => {}
                 }
-                Event::Resize(_, _) => {
-                    resize_remote_parser(terminal, parser)?;
-                }
-                _ => {}
             }
-        }
-
-        match client.read_interactive()? {
-            NetworkRead::Data(data) => parser.process(&data),
-            NetworkRead::Idle => {}
-            NetworkRead::Closed => return Ok(TuiEnd::RemoteClosed),
+            network = client.read_interactive() => {
+                match network? {
+                    NetworkRead::Data(data) => parser.process(&data),
+                    NetworkRead::Idle => {}
+                    NetworkRead::Closed => return Ok(TuiEnd::RemoteClosed),
+                }
+                client.flush_negotiation().await?;
+            }
         }
     }
 }
 
-fn open_file_picker(state: &mut TuiState) {
-    match FilePicker::from_current_dir() {
+async fn open_file_picker(state: &mut TuiState) {
+    match FilePicker::from_current_dir().await {
         Ok(picker) => {
             state.file_picker = Some(picker);
             state.mode = TuiMode::FilePicker;
@@ -250,7 +261,7 @@ fn open_file_picker(state: &mut TuiState) {
     }
 }
 
-fn execute_upload(
+async fn execute_upload(
     terminal: &mut TuiTerminal,
     client: &mut TelnetClient,
     parser: &mut vt100::Parser,
@@ -272,30 +283,29 @@ fn execute_upload(
     state.status = format!("Sending {}", path.display());
     draw_terminal_ui(terminal, parser, state)?;
 
-    client.set_read_timeout(transfer_timeout)?;
-    let result = ymodem::send_file_with(client, path, |event| {
+    let result = upload::send_file_with(client, path, transfer_timeout, async |event| {
         match event {
             UploadEvent::Output(byte) => parser.process(&[byte]),
             UploadEvent::Progress { sent, total } => {
                 state.transfer = Some(TransferProgress {
                     name: name.clone(),
-                    sent,
-                    total,
+                    sent: sent as u64,
+                    total: total as u64,
                 });
             }
         }
         resize_remote_parser(terminal, parser)?;
         draw_terminal_ui(terminal, parser, state)
-    });
-    let restore = client.restore_interactive_timeout();
+    })
+    .await;
     state.transfer = None;
 
-    match (result, restore) {
-        (Ok(size), Ok(())) => {
+    match result {
+        Ok(size) => {
             state.status = format!("YMODEM complete: {size} bytes");
             Ok(())
         }
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 

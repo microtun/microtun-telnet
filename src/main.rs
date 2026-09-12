@@ -5,10 +5,11 @@ use std::{
 };
 
 use clap::Parser;
+
 mod keymap;
 mod telnet;
 mod tui;
-mod ymodem;
+mod upload;
 
 use telnet::TelnetClient;
 
@@ -35,8 +36,9 @@ struct Cli {
     timeout: u64,
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
@@ -45,16 +47,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), String> {
+async fn run(cli: Cli) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("microtun-telnet requires an interactive terminal".to_owned());
     }
 
     let port = cli.port.unwrap_or(DEFAULT_TELNET_PORT);
+    let timeout = Duration::from_secs(cli.timeout);
     eprintln!("connecting to {} on port {port}", cli.target);
 
-    let client = TelnetClient::connect(&cli.target, port, Duration::from_secs(cli.timeout))?;
-    tui::run_session(client, &cli.target, port, Duration::from_secs(cli.timeout))
+    let client = TelnetClient::connect(&cli.target, port, timeout).await?;
+    tui::run_session(client, &cli.target, port, timeout).await
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use tokio::fs;
 
 use super::centered_rect;
 
@@ -24,14 +25,14 @@ pub(crate) struct FilePicker {
 }
 
 impl FilePicker {
-    pub(crate) fn from_current_dir() -> Result<Self, String> {
+    pub(crate) async fn from_current_dir() -> Result<Self, String> {
         let cwd =
             std::env::current_dir().map_err(|error| format!("read current directory: {error}"))?;
-        Self::open(cwd)
+        Self::open(cwd).await
     }
 
-    fn open(cwd: PathBuf) -> Result<Self, String> {
-        let entries = read_entries(&cwd)?;
+    async fn open(cwd: PathBuf) -> Result<Self, String> {
+        let entries = read_entries(&cwd).await?;
         Ok(Self {
             cwd,
             entries,
@@ -39,8 +40,8 @@ impl FilePicker {
         })
     }
 
-    fn reload(&mut self) -> Result<(), String> {
-        self.entries = read_entries(&self.cwd)?;
+    async fn reload(&mut self) -> Result<(), String> {
+        self.entries = read_entries(&self.cwd).await?;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
         Ok(())
     }
@@ -54,31 +55,32 @@ impl FilePicker {
         self.selected = self.selected.saturating_add_signed(delta).min(last);
     }
 
-    fn enter_selected(&mut self) -> Result<PickerAction, String> {
+    async fn enter_selected(&mut self) -> Result<PickerAction, String> {
         let Some(entry) = self.entries.get(self.selected) else {
             return Ok(PickerAction::None);
         };
         let path = entry.path.clone();
-        if entry.is_dir {
+        let is_dir = entry.is_dir;
+        if is_dir {
             self.cwd = path;
             self.selected = 0;
-            self.reload()?;
+            self.reload().await?;
             Ok(PickerAction::None)
         } else {
             Ok(PickerAction::Upload(path))
         }
     }
 
-    fn go_parent(&mut self) -> Result<(), String> {
+    async fn go_parent(&mut self) -> Result<(), String> {
         let Some(parent) = self.cwd.parent() else {
             return Ok(());
         };
         self.cwd = parent.to_path_buf();
         self.selected = 0;
-        self.reload()
+        self.reload().await
     }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Result<PickerAction, String> {
+    pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> Result<PickerAction, String> {
         match key.code {
             KeyCode::Esc => Ok(PickerAction::Cancel),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -109,12 +111,12 @@ impl FilePicker {
                 Ok(PickerAction::None)
             }
             KeyCode::Backspace | KeyCode::Left => {
-                self.go_parent()?;
+                self.go_parent().await?;
                 Ok(PickerAction::None)
             }
-            KeyCode::Enter | KeyCode::Right => self.enter_selected(),
+            KeyCode::Enter | KeyCode::Right => self.enter_selected().await,
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.reload()?;
+                self.reload().await?;
                 Ok(PickerAction::None)
             }
             _ => Ok(PickerAction::None),
@@ -180,7 +182,7 @@ pub(crate) enum PickerAction {
     Upload(PathBuf),
 }
 
-fn read_entries(cwd: &Path) -> Result<Vec<FilePickerEntry>, String> {
+async fn read_entries(cwd: &Path) -> Result<Vec<FilePickerEntry>, String> {
     let mut entries = Vec::new();
     if let Some(parent) = cwd.parent() {
         entries.push(FilePickerEntry {
@@ -190,16 +192,20 @@ fn read_entries(cwd: &Path) -> Result<Vec<FilePickerEntry>, String> {
         });
     }
 
-    let directory = std::fs::read_dir(cwd)
+    let mut directory = fs::read_dir(cwd)
+        .await
         .map_err(|error| format!("open directory {}: {error}", cwd.display()))?;
     let mut children = Vec::new();
-    for entry in directory {
-        let Ok(entry) = entry else {
-            continue;
-        };
+    while let Some(entry) = directory
+        .next_entry()
+        .await
+        .map_err(|error| format!("read directory {}: {error}", cwd.display()))?
+    {
         let path = entry.path();
-        let is_dir = std::fs::metadata(&path)
-            .map(|metadata| metadata.is_dir())
+        let is_dir = entry
+            .file_type()
+            .await
+            .map(|file_type| file_type.is_dir())
             .unwrap_or(false);
         let mut name = entry.file_name().to_string_lossy().into_owned();
         if is_dir {
@@ -220,26 +226,24 @@ fn read_entries(cwd: &Path) -> Result<Vec<FilePickerEntry>, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
-    #[test]
-    fn lists_parent_and_directories_before_files() {
+    #[tokio::test]
+    async fn lists_parent_and_directories_before_files() {
         let root = std::env::temp_dir().join(format!(
             "microtun-telnet-picker-test-{}",
             std::process::id()
         ));
         let child = root.join("child");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&child).unwrap();
-        fs::write(root.join("z.bin"), b"z").unwrap();
-        fs::write(root.join("a.bin"), b"a").unwrap();
+        let _ = fs::remove_dir_all(&root).await;
+        fs::create_dir_all(&child).await.unwrap();
+        fs::write(root.join("z.bin"), b"z").await.unwrap();
+        fs::write(root.join("a.bin"), b"a").await.unwrap();
 
-        let picker = FilePicker::open(child.clone()).unwrap();
+        let picker = FilePicker::open(child.clone()).await.unwrap();
         assert_eq!(picker.entries[0].name, "../");
 
-        let root_picker = FilePicker::open(root.clone()).unwrap();
+        let root_picker = FilePicker::open(root.clone()).await.unwrap();
         let names = root_picker
             .entries
             .iter()
@@ -247,7 +251,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["../", "child/", "a.bin", "z.bin"]);
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]

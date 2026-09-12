@@ -1,8 +1,7 @@
-use std::{
-    io::{self, Read, Write},
-    net::{Shutdown, TcpStream, ToSocketAddrs},
-    time::Duration,
-};
+use std::{collections::VecDeque, io, time::Duration};
+
+use microtun_ymodem::{ReadError, Transport};
+use tokio::{io::AsyncWriteExt, net::TcpStream, time};
 
 const IAC: u8 = 0xff;
 const WILL: u8 = 0xfb;
@@ -14,7 +13,6 @@ const SE: u8 = 0xf0;
 const TELNET_BINARY: u8 = 0;
 const TELNET_ECHO: u8 = 1;
 const TELNET_SUPPRESS_GO_AHEAD: u8 = 3;
-const INTERACTIVE_READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy)]
 enum TelnetRxState {
@@ -28,98 +26,73 @@ enum TelnetRxState {
 pub(crate) struct TelnetClient {
     stream: TcpStream,
     rx_state: TelnetRxState,
+    decoded: VecDeque<u8>,
+    negotiation_replies: Vec<u8>,
 }
 
 impl TelnetClient {
-    pub(crate) fn connect(target: &str, port: u16, timeout: Duration) -> Result<Self, String> {
-        let endpoints = (target, port)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolve {target}: {error}"))?;
-        let mut last_error = None;
-        let mut connected = None;
-
-        for endpoint in endpoints {
-            match TcpStream::connect_timeout(&endpoint, timeout) {
-                Ok(stream) => {
-                    connected = Some((stream, endpoint));
-                    break;
-                }
-                Err(error) => last_error = Some((endpoint, error)),
-            }
-        }
-
-        let (stream, endpoint) = connected.ok_or_else(|| match last_error {
-            Some((endpoint, error)) => format!("connect to {endpoint}: {error}"),
-            None => format!("resolve {target}: no addresses returned"),
-        })?;
+    pub(crate) async fn connect(
+        target: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let stream = match time::timeout(timeout, TcpStream::connect((target, port))).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(format!("connect to {target}:{port}: {error}")),
+            Err(_) => return Err(format!("connect to {target}:{port}: timed out")),
+        };
         stream
-            .set_read_timeout(Some(INTERACTIVE_READ_TIMEOUT))
-            .map_err(|error| format!("set read timeout for {endpoint}: {error}"))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|error| format!("set write timeout for {endpoint}: {error}"))?;
-        let _ = stream.set_nodelay(true);
+            .set_nodelay(true)
+            .map_err(|error| format!("set TCP_NODELAY for {target}:{port}: {error}"))?;
+
         Ok(Self {
             stream,
             rx_state: TelnetRxState::Data,
+            decoded: VecDeque::new(),
+            negotiation_replies: Vec::new(),
         })
     }
 
-    pub(crate) fn shutdown(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+    pub(crate) async fn shutdown(&mut self) {
+        let _ = self.stream.shutdown().await;
     }
 
-    pub(crate) fn set_read_timeout(&self, timeout: Duration) -> Result<(), String> {
+    pub(crate) async fn read_interactive(&mut self) -> Result<NetworkRead, String> {
+        if !self.decoded.is_empty() {
+            return Ok(NetworkRead::Data(self.take_decoded()));
+        }
+
         self.stream
-            .set_read_timeout(Some(timeout))
-            .map_err(|error| format!("set Telnet read timeout: {error}"))
-    }
+            .readable()
+            .await
+            .map_err(|error| format!("wait for Telnet data: {error}"))?;
 
-    pub(crate) fn restore_interactive_timeout(&self) -> Result<(), String> {
-        self.set_read_timeout(INTERACTIVE_READ_TIMEOUT)
-    }
-
-    pub(crate) fn read_interactive(&mut self) -> Result<NetworkRead, String> {
         let mut wire = [0u8; 4096];
-        match self.stream.read(&mut wire) {
+        match self.stream.try_read(&mut wire) {
             Ok(0) => Ok(NetworkRead::Closed),
             Ok(len) => {
-                let mut data = Vec::with_capacity(len);
-                for &byte in &wire[..len] {
-                    if let Some(byte) = self.process_wire_byte(byte)? {
-                        data.push(byte);
-                    }
-                }
-                Ok(NetworkRead::Data(data))
+                self.process_wire_bytes(&wire[..len]);
+                Ok(NetworkRead::Data(self.take_decoded()))
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(NetworkRead::Idle)
-            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(NetworkRead::Idle),
             Err(error) if is_remote_disconnect(error.kind()) => Ok(NetworkRead::Closed),
             Err(error) => Err(format!("read Telnet connection: {error}")),
         }
     }
 
-    pub(crate) fn read_data_byte(&mut self) -> Result<u8, String> {
-        loop {
-            let mut byte = [0u8; 1];
-            self.stream
-                .read_exact(&mut byte)
-                .map_err(|error| format!("read Telnet connection: {error}"))?;
-            if let Some(byte) = self.process_wire_byte(byte[0])? {
-                return Ok(byte);
-            }
+    pub(crate) async fn flush_negotiation(&mut self) -> Result<(), String> {
+        if self.negotiation_replies.is_empty() {
+            return Ok(());
         }
+
+        let replies = std::mem::take(&mut self.negotiation_replies);
+        self.stream
+            .write_all(&replies)
+            .await
+            .map_err(|error| format!("write Telnet negotiation response: {error}"))
     }
 
-    pub(crate) fn write_data(&mut self, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) async fn write_data(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut encoded = Vec::with_capacity(bytes.len() + 16);
         for &byte in bytes {
             encoded.push(byte);
@@ -129,53 +102,63 @@ impl TelnetClient {
         }
         self.stream
             .write_all(&encoded)
+            .await
             .map_err(|error| format!("write Telnet data: {error}"))
     }
 
-    pub(crate) fn flush(&mut self) -> Result<(), String> {
+    async fn flush_data(&mut self) -> Result<(), String> {
         self.stream
             .flush()
+            .await
             .map_err(|error| format!("flush Telnet connection: {error}"))
     }
 
-    fn process_wire_byte(&mut self, byte: u8) -> Result<Option<u8>, String> {
+    fn process_wire_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if let Some(byte) = self.process_wire_byte(byte) {
+                self.decoded.push_back(byte);
+            }
+        }
+    }
+
+    fn process_wire_byte(&mut self, byte: u8) -> Option<u8> {
         match self.rx_state {
             TelnetRxState::Data => {
                 if byte == IAC {
                     self.rx_state = TelnetRxState::Iac;
-                    Ok(None)
+                    None
                 } else {
-                    Ok(Some(byte))
+                    Some(byte)
                 }
             }
             TelnetRxState::Iac => match byte {
                 IAC => {
                     self.rx_state = TelnetRxState::Data;
-                    Ok(Some(IAC))
+                    Some(IAC)
                 }
                 WILL | WONT | DO | DONT => {
                     self.rx_state = TelnetRxState::Negotiation(byte);
-                    Ok(None)
+                    None
                 }
                 SB => {
                     self.rx_state = TelnetRxState::Subnegotiation;
-                    Ok(None)
+                    None
                 }
                 _ => {
                     self.rx_state = TelnetRxState::Data;
-                    Ok(None)
+                    None
                 }
             },
             TelnetRxState::Negotiation(command) => {
-                self.reply_to_negotiation(command, byte)?;
+                self.queue_negotiation_reply(command, byte);
                 self.rx_state = TelnetRxState::Data;
-                Ok(None)
+                None
             }
             TelnetRxState::Subnegotiation => {
                 if byte == IAC {
                     self.rx_state = TelnetRxState::SubnegotiationIac;
                 }
-                Ok(None)
+                None
             }
             TelnetRxState::SubnegotiationIac => {
                 self.rx_state = if byte == SE {
@@ -183,12 +166,12 @@ impl TelnetClient {
                 } else {
                     TelnetRxState::Subnegotiation
                 };
-                Ok(None)
+                None
             }
         }
     }
 
-    fn reply_to_negotiation(&mut self, command: u8, option: u8) -> Result<(), String> {
+    fn queue_negotiation_reply(&mut self, command: u8, option: u8) {
         let accepted = matches!(
             option,
             TELNET_BINARY | TELNET_ECHO | TELNET_SUPPRESS_GO_AHEAD
@@ -200,11 +183,68 @@ impl TelnetClient {
             DO => WONT,
             WONT => DONT,
             DONT => WONT,
-            _ => return Ok(()),
+            _ => return,
         };
-        self.stream
-            .write_all(&[IAC, reply, option])
-            .map_err(|error| format!("write Telnet negotiation response: {error}"))
+        self.negotiation_replies
+            .extend_from_slice(&[IAC, reply, option]);
+    }
+
+    fn take_decoded(&mut self) -> Vec<u8> {
+        self.decoded.drain(..).collect()
+    }
+
+    async fn wait_for_wire_readable(&self, timeout_ms: u32) -> Result<(), ReadError<String>> {
+        match time::timeout(
+            Duration::from_millis(u64::from(timeout_ms)),
+            self.stream.readable(),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(ReadError::Io(format!("wait for Telnet data: {error}"))),
+            Err(_) => Err(ReadError::Timeout),
+        }
+    }
+}
+
+impl Transport for TelnetClient {
+    type Error = String;
+
+    async fn read_byte(&mut self, timeout_ms: u32) -> Result<u8, ReadError<Self::Error>> {
+        if let Some(byte) = self.decoded.pop_front() {
+            return Ok(byte);
+        }
+
+        loop {
+            self.wait_for_wire_readable(timeout_ms).await?;
+
+            let mut wire = [0u8; 4096];
+            match self.stream.try_read(&mut wire) {
+                Ok(0) => {
+                    return Err(ReadError::Io(
+                        "Telnet connection closed by remote host".to_owned(),
+                    ));
+                }
+                Ok(len) => self.process_wire_bytes(&wire[..len]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    return Err(ReadError::Io(format!("read Telnet connection: {error}")));
+                }
+            }
+
+            self.flush_negotiation().await.map_err(ReadError::Io)?;
+            if let Some(byte) = self.decoded.pop_front() {
+                return Ok(byte);
+            }
+        }
+    }
+
+    async fn write_all(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.write_data(bytes).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush_data().await
     }
 }
 
