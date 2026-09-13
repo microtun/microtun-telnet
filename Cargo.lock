@@ -240,6 +240,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-adapters"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c900a1c087f1f7d17cdc84a1290df91521cd90933efa76d68e568385d889f2f4"
+dependencies = [
+ "embedded-io",
+ "embedded-io-async",
+ "tokio",
+]
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -408,10 +434,12 @@ dependencies = [
 
 [[package]]
 name = "microtun-telnet"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "crossterm",
+ "embedded-io-adapters",
+ "embedded-io-async",
  "futures-util",
  "microtun-ymodem",
  "ratatui",
@@ -421,10 +449,11 @@ dependencies = [
 
 [[package]]
 name = "microtun-ymodem"
-version = "0.1.0"
-source = "git+https://github.com/microtun/microtun-ymodem?tag=v0.1.0#7e3514e47eafcd2d441d2992cecb3063eefa5d7a"
+version = "0.2.0"
+source = "git+https://github.com/microtun/microtun-ymodem?tag=v0.2.0#9a8ceedbbc08b822202aea6fe2db267644372e96"
 dependencies = [
  "crc",
+ "embedded-io-async",
 ]
 
 [[package]]

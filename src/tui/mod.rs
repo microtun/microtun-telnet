@@ -1,4 +1,4 @@
-use std::{io, path::Path, time::Duration};
+use std::{io, path::Path};
 
 use crossterm::{
     cursor::Show,
@@ -6,6 +6,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use embedded_io_async::{Read, Write};
 use futures_util::StreamExt;
 use ratatui::{
     Terminal,
@@ -19,7 +20,7 @@ use tui_term::{vt100, widget::PseudoTerminal};
 
 use crate::{
     keymap::{COMMAND_KEY, is_command_key, key_to_telnet_bytes},
-    telnet::{NetworkRead, TelnetClient},
+    telnet::TelnetClient,
     upload::{self, UploadEvent},
 };
 
@@ -72,7 +73,6 @@ pub(crate) async fn run_session(
     mut client: TelnetClient,
     target: &str,
     port: u16,
-    transfer_timeout: Duration,
 ) -> Result<(), String> {
     enable_raw_mode().map_err(|error| format!("enable terminal raw mode: {error}"))?;
     let mut stdout = io::stdout();
@@ -100,17 +100,9 @@ pub(crate) async fn run_session(
             transfer: None,
         };
 
-        run_loop(
-            &mut terminal,
-            &mut client,
-            &mut parser,
-            &mut state,
-            transfer_timeout,
-        )
-        .await?
+        run_loop(&mut terminal, &mut client, &mut parser, &mut state).await?
     };
 
-    client.shutdown().await;
     if end == TuiEnd::RemoteClosed {
         eprintln!("connection closed by remote host");
     }
@@ -122,9 +114,9 @@ async fn run_loop(
     client: &mut TelnetClient,
     parser: &mut vt100::Parser,
     state: &mut TuiState,
-    transfer_timeout: Duration,
 ) -> Result<TuiEnd, String> {
     let mut events = EventStream::new();
+    let mut network_buf = [0u8; 4096];
 
     loop {
         resize_remote_parser(terminal, parser)?;
@@ -148,12 +140,18 @@ async fn run_loop(
                                 }
 
                                 if let Some(bytes) = key_to_telnet_bytes(key) {
-                                    client.write_data(&bytes).await?;
+                                    client
+                                        .write_all(&bytes)
+                                        .await
+                                        .map_err(|error| format!("write Telnet data: {error}"))?;
                                 }
                             }
                             TuiMode::CommandPrefix => match key.code {
                                 _ if is_command_key(key) => {
-                                    client.write_data(&[COMMAND_KEY]).await?;
+                                    client
+                                        .write_all(&[COMMAND_KEY])
+                                        .await
+                                        .map_err(|error| format!("write Telnet data: {error}"))?;
                                     state.status = "Sent Ctrl-A to remote".to_owned();
                                     state.mode = TuiMode::Session;
                                 }
@@ -216,7 +214,6 @@ async fn run_loop(
                                             parser,
                                             state,
                                             &path,
-                                            transfer_timeout,
                                         )
                                         .await
                                         {
@@ -236,13 +233,13 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            network = client.read_interactive() => {
-                match network? {
-                    NetworkRead::Data(data) => parser.process(&data),
-                    NetworkRead::Idle => {}
-                    NetworkRead::Closed => return Ok(TuiEnd::RemoteClosed),
+            network = client.read(&mut network_buf) => {
+                match network {
+                    Ok(0) => return Ok(TuiEnd::RemoteClosed),
+                    Ok(len) => parser.process(&network_buf[..len]),
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+                    Err(error) => return Err(format!("read Telnet connection: {error}")),
                 }
-                client.flush_negotiation().await?;
             }
         }
     }
@@ -267,7 +264,6 @@ async fn execute_upload(
     parser: &mut vt100::Parser,
     state: &mut TuiState,
     path: &Path,
-    transfer_timeout: Duration,
 ) -> Result<(), String> {
     let name = path
         .file_name()
@@ -283,7 +279,7 @@ async fn execute_upload(
     state.status = format!("Sending {}", path.display());
     draw_terminal_ui(terminal, parser, state)?;
 
-    let result = upload::send_file_with(client, path, transfer_timeout, async |event| {
+    let result = upload::send_file_with(client, path, async |event| {
         match event {
             UploadEvent::Output(byte) => parser.process(&[byte]),
             UploadEvent::Progress { sent, total } => {

@@ -31,7 +31,7 @@ struct Cli {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Telnet connect and YMODEM transfer timeout in seconds.
+    /// Telnet connect/read and YMODEM transfer timeout in seconds.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 }
@@ -57,7 +57,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     eprintln!("connecting to {} on port {port}", cli.target);
 
     let client = TelnetClient::connect(&cli.target, port, timeout).await?;
-    tui::run_session(client, &cli.target, port, timeout).await
+    tui::run_session(client, &cli.target, port).await
 }
 
 #[cfg(test)]

@@ -1,30 +1,18 @@
-use std::{io, path::Path, time::Duration};
+use std::{io, path::Path};
 
 use core::ops::AsyncFnMut;
 
-use microtun_ymodem::{Config, Metadata, SendError, SendEvent, Source, send_with};
-use tokio::{fs::File, io::AsyncReadExt};
+use embedded_io_adapters::tokio_1::FromTokio;
+use microtun_ymodem::{Config, Metadata, SendError, SendEvent, send_with};
+use tokio::fs::File;
 
 use crate::telnet::TelnetClient;
 
 pub(crate) use microtun_ymodem::SendEvent as UploadEvent;
 
-struct TokioFileSource {
-    file: File,
-}
-
-impl Source for TokioFileSource {
-    type Error = io::Error;
-
-    async fn read(&mut self, output: &mut [u8]) -> Result<usize, Self::Error> {
-        self.file.read(output).await
-    }
-}
-
 pub(crate) async fn send_file_with<F>(
     client: &mut TelnetClient,
     path: &Path,
-    timeout: Duration,
     notify: F,
 ) -> Result<u64, String>
 where
@@ -46,7 +34,7 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or("upload.bin");
 
-    let mut source = TokioFileSource { file };
+    let mut source = FromTokio::new(file);
     let transfer = send_with(
         client,
         &mut source,
@@ -54,7 +42,7 @@ where
             filename: filename.as_bytes(),
             file_size,
         },
-        config_from_timeout(timeout),
+        ymodem_config(),
         notify,
     )
     .await
@@ -63,22 +51,20 @@ where
     Ok(transfer.file_size as u64)
 }
 
-fn config_from_timeout(timeout: Duration) -> Config {
-    let timeout_ms = u32::try_from(timeout.as_millis())
-        .unwrap_or(u32::MAX)
-        .max(1);
+fn ymodem_config() -> Config {
     Config {
-        start_timeout_ms: timeout_ms,
-        transfer_timeout_ms: timeout_ms,
+        // TelnetClient applies the CLI timeout to each embedded-io read. One
+        // start retry therefore keeps startup bounded to one timed wait.
         start_retries: 1,
         ..Config::default()
     }
 }
 
-fn format_send_error(error: SendError<String, io::Error, String>) -> String {
+fn format_send_error(error: SendError<io::Error, io::Error, String>) -> String {
     match error {
-        SendError::Io(error) => error,
+        SendError::Io(error) => error.to_string(),
         SendError::Timeout => "YMODEM transfer timed out".to_owned(),
+        SendError::EndOfStream => "Telnet connection closed during YMODEM transfer".to_owned(),
         SendError::Cancelled => "device cancelled YMODEM transfer".to_owned(),
         SendError::Protocol => "unexpected YMODEM protocol response".to_owned(),
         SendError::InvalidFilename => "YMODEM filename is empty or contains NUL".to_owned(),
@@ -92,7 +78,7 @@ fn format_send_error(error: SendError<String, io::Error, String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use microtun_ymodem::{BLOCK_SIZE, HEADER_BLOCK_SIZE, crc16};
     use tokio::{
@@ -252,7 +238,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            send_file_with(&mut client, &path, Duration::from_secs(1), async |_| Ok(()))
+            send_file_with(&mut client, &path, async |_| Ok(()))
                 .await
                 .unwrap(),
             12
@@ -262,10 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_timeout_maps_to_one_ymodem_wait() {
-        let config = config_from_timeout(Duration::from_secs(7));
-        assert_eq!(config.start_timeout_ms, 7_000);
-        assert_eq!(config.transfer_timeout_ms, 7_000);
-        assert_eq!(config.start_retries, 1);
+    fn ymodem_startup_uses_one_timed_wait() {
+        assert_eq!(ymodem_config().start_retries, 1);
     }
 }

@@ -4,7 +4,7 @@
 
 The client is asynchronous end-to-end around Tokio. TCP I/O uses `tokio::net`, upload files use
 `tokio::fs`, terminal events are consumed through Crossterm's async `EventStream`, and YMODEM is
-provided by [`microtun-ymodem`](https://github.com/microtun/microtun-ymodem) `v0.1.0` rather than a
+provided by [`microtun-ymodem`](https://github.com/microtun/microtun-ymodem) `v0.2.0` rather than a
 client-local protocol implementation.
 
 ## Build
@@ -39,22 +39,28 @@ The TCP port defaults to Telnet port `23`. Override it with `--port`:
 microtun-telnet 100.64.0.3 --port 2323
 ```
 
-Use `--timeout <SECONDS>` to change the TCP connect timeout and the per-wait YMODEM transfer
+Use `--timeout <SECONDS>` to change the TCP connect timeout and the per-read Telnet/YMODEM
 timeout. The client requires an interactive terminal; redirected stdin/stdout and a separate plain
 text mode are intentionally not supported.
 
 ## Async architecture
 
-The Telnet client owns the Tokio `TcpStream` and implements `microtun_ymodem::Transport` directly.
-Incoming Telnet negotiation and subnegotiation bytes are removed before YMODEM sees the stream,
-and outgoing YMODEM data is Telnet-escaped so protocol bytes containing `0xff` remain binary-safe.
+`TelnetClient` owns the Tokio `TcpStream` and directly implements
+`embedded_io_async::Read + embedded_io_async::Write`. Incoming Telnet negotiation and
+subnegotiation bytes are removed before callers see the stream, and outgoing data is Telnet-escaped
+so protocol bytes containing `0xff` remain binary-safe. The client applies the CLI timeout
+to each embedded-I/O read and reports the standard `TimedOut` error kind required by
+`microtun-ymodem` v0.2.0. YMODEM therefore receives `&mut TelnetClient` directly with no
+transport-specific adapter layer.
 
-`src/upload.rs` is intentionally thin: it adapts `tokio::fs::File` to
-`microtun_ymodem::Source`, builds the YMODEM metadata/configuration, and maps library events and
-errors into the CLI. The YMODEM state machine itself lives only in `microtun-ymodem`.
+`src/upload.rs` is intentionally thin: it wraps `tokio::fs::File` with
+`embedded_io_adapters::tokio_1::FromTokio`, builds the YMODEM metadata/configuration, and maps
+library events and errors into the CLI. The YMODEM state machine itself lives only in
+`microtun-ymodem`.
 
-The interactive session uses `tokio::select!` to wait on terminal events and socket readability
-without periodic blocking read timeouts.
+The interactive session uses the same `embedded_io_async::Read + Write` implementation as YMODEM.
+`tokio::select!` waits on terminal events and Telnet reads; interactive read timeouts are simply
+treated as idle periods.
 
 ## Terminal UI
 
